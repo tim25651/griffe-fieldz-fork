@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
 import textwrap
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
 import fieldz
@@ -25,7 +27,7 @@ from griffe import (
 )
 
 if TYPE_CHECKING:
-    import ast
+    from collections.abc import Iterator
 
     from griffe import Expr, Inspector, Visitor
 
@@ -72,11 +74,13 @@ class FieldzExtension(Extension):
             fieldz.get_adapter(runtime_obj)
         except TypeError:
             return
-        self._inject_fields(cls, runtime_obj)
+        self._inject_fields(node, cls, runtime_obj, agent)
 
     # ------------------------------
 
-    def _inject_fields(self, obj: Object, runtime_obj: Any) -> None:
+    def _inject_fields(
+        self, node: ast.AST, obj: Object, runtime_obj: Any, agent: Visitor | Inspector
+    ) -> None:
         # update the object instance with the evaluated docstring
         docstring = inspect.cleandoc(getattr(runtime_obj, "__doc__", "") or "")
         if not obj.docstring:
@@ -89,7 +93,16 @@ class FieldzExtension(Extension):
             annotations = getattr(runtime_obj, "__annotations__", {})
             fields = tuple(f for f in fields if f.name in annotations)
 
-        params, attrs = _fields_to_params(fields, obj.docstring, self.include_private)
+        with _agent_temp_members(agent):
+            agent.visit(node)
+            for subnode in node.body:
+                if not isinstance(subnode, ast.Assign | ast.AnnAssign):
+                    continue
+                agent.visit(subnode)
+
+            params, attrs = _fields_to_params(
+                fields, agent, obj.docstring, self.include_private
+            )
 
         # merge/add field info to docstring
         if params:
@@ -126,8 +139,32 @@ def _default_repr(field: fieldz.Field) -> str | None:
     return None
 
 
+@contextmanager
+def _agent_temp_members(agent: Visitor | Inspector) -> Iterator[None]:
+    """Use a temporary members dictionary in the scope of the context."""
+    prev_members = agent.current.members
+    try:
+        agent.current.members = {}
+        yield
+    finally:
+        agent.current.members = prev_members
+
+
+def _agent_docstring(
+    agent: Visitor | Inspector, name: str
+) -> tuple[str | None, Expr | str | None]:
+    """Get the docstring from griffe's attribute handling."""
+    member = agent.current.members.get(name)
+    if not member:
+        return None, None
+    docstring = member.docstring.value if member.docstring else None
+    annotation = member.annotation
+    return docstring, annotation
+
+
 def _fields_to_params(
     fields: Iterable[fieldz.Field],
+    agent: Visitor | Inspector,
     docstring: Docstring,
     include_private: bool = False,
 ) -> tuple[list[DocstringParameter], list[DocstringAttribute]]:
@@ -135,10 +172,17 @@ def _fields_to_params(
     params: list[DocstringParameter] = []
     attrs: list[DocstringAttribute] = []
     for field in fields:
-        description = field.description or field.metadata.get("description", "") or ""
+        agent_doc, agent_ann = _agent_docstring(agent, field.name)
+        description = (
+            field.description
+            or field.metadata.get("description", "")
+            or agent_doc
+            or ""
+        )
+        annotation = agent_ann or _to_annotation(field.type, docstring)
         kwargs: dict = {
             "name": field.name,
-            "annotation": _to_annotation(field.type, docstring),
+            "annotation": annotation,
             "description": textwrap.dedent(description).strip(),
             "value": _default_repr(field),
         }
